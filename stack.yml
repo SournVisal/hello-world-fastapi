@@ -1,0 +1,19 @@
+version: '3.8'
+services:
+  app:
+    image: hello-world-fastapi:latest
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+networks:
+  default:
+    driver: overlay
