@@ -1,0 +1,122 @@
+success with verify deployment.
+
+
+pipeline {
+    agent any
+    environment {
+        IMAGE_NAME = "hello-world-fastapi"
+        STACK_NAME = "hello-world-fastapi"
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                git branch: 'main',  url: 'https://github.com/sournvisal/hello-world-fastapi.git'
+            }
+        }
+        stage('Set Version') {
+            steps {
+                script {
+                    def version = readFile('version.txt').trim()
+                    env.IMAGE_TAG = version
+                    def parts = version.split('\\.')
+                    def patch = (parts[2].toInteger() + 1)
+                    env.NEXT_VERSION = "${parts[0]}.${parts[1]}.${patch}"
+                    env.PREVIOUS_VERSION = sh(script: "docker images ${IMAGE_NAME} --format '{{.Tag}}' | grep -v latest | sort -V | tail -n 1 || echo 'none'", returnStdout: true).trim()
+                }
+            }
+        }
+        stage('Build') {
+            steps {
+                sh 'docker build -t ${IMAGE_NAME}:${IMAGE_TAG} .'
+                sh 'docker tag ${IMAGE_NAME}:${IMAGE_TAG} ${IMAGE_NAME}:latest'
+            }
+        }
+        stage('Generate Stack File') {
+            steps {
+                script {
+                    writeFile file: 'stack.yml', text: """
+version: '3.8'
+services:
+  app:
+    image: ${IMAGE_NAME}:${IMAGE_TAG}
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          cpus: "0.75"
+          memory: 512M
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+networks:
+  default:
+    driver: overlay
+"""
+                }
+            }
+        }
+        stage('Deploy') {
+            steps {
+                sh 'ls -l stack.yml || echo "stack.yml not found"'
+                sh 'docker stack deploy -c stack.yml ${STACK_NAME}'
+            }
+        }
+        stage('Verify Deployment') {
+            steps {
+                script {
+                    sleep 90
+                    sh 'docker info --format "{{.Swarm.LocalNodeState}}"'
+                    sh 'docker stack services ${STACK_NAME}'
+                    def services = sh(script: "docker stack services ${STACK_NAME} --format '{{.Replicas}}'", returnStdout: true).trim()
+                    sh 'docker service logs ${STACK_NAME}_app || echo "No logs available"'
+                    retry(3) {
+                        sh 'curl -f http://127.0.0.1:8000 || exit 1'
+                    }
+                    if (services.contains('2/2')) {
+                        echo "Deployment successful: 2/2 replicas running"
+                        writeFile file: 'version.txt', text: "${env.NEXT_VERSION}"
+                    } else {
+                        error "Deployment failed: Replicas not running as expected (${services})"
+                    }
+                }
+            }
+        }
+    }
+    post {
+        failure {
+            script {
+                if (env.PREVIOUS_VERSION != 'none') {
+                    echo "Deployment failed. Rolling back to ${IMAGE_NAME}:${env.PREVIOUS_VERSION}"
+                    writeFile file: 'stack.yml', text: """
+version: '3.8'
+services:
+  app:
+    image: ${IMAGE_NAME}:${env.PREVIOUS_VERSION}
+    deploy:
+      replicas: 2
+      restart_policy:
+        condition: on-failure
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+    ports:
+      - "8000:8000"
+    environment:
+      - PYTHONUNBUFFERED=1
+networks:
+  default:
+    driver: overlay
+"""
+                    sh 'docker stack deploy -c stack.yml ${STACK_NAME}'
+                    error "Rolled back to ${IMAGE_NAME}:${env.PREVIOUS_VERSION}. Pipeline failed."
+                } else {
+                    echo "No previous version available for rollback."
+                }
+            }
+        }
+    }
+}
